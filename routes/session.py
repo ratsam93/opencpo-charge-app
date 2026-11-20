@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from core.api import api_get, api_post
+from core.security import authorize_session, forbidden, grant_session, safe_error, browser_owns
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,14 @@ async def create_session(request: Request):
                 f"/api/v1/public/sessions/pending?cp_id={cp_id}&driver_phone={driver_phone}"
             )
             # If a pending session exists for the SAME connector, reuse it
+            # Only reuse it when THIS browser created it: the phone number is
+            # unverified, so anyone could otherwise fetch someone else's session.
             if existing and isinstance(existing, dict):
                 ex_connector = existing.get("connector_id")
                 ex_status = existing.get("status", "")
-                if ex_connector == connector_id and ex_status in ("pending", "awaiting_payment"):
+                ex_id = existing.get("id") or existing.get("session_id")
+                if (ex_connector == connector_id and ex_status in ("pending", "awaiting_payment")
+                        and ex_id is not None and browser_owns(request, str(ex_id))):
                     return JSONResponse(existing)
         except Exception:
             # Endpoint may not exist or return 404 — not fatal, proceed to create
@@ -76,9 +81,13 @@ async def create_session(request: Request):
 
     try:
         result = await api_post("/api/v1/public/sessions", body)
-        return JSONResponse(result)
     except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+        return safe_error(e)
+    response = JSONResponse(result)
+    new_id = result.get("id") or result.get("session_id") if isinstance(result, dict) else None
+    if new_id is not None:
+        grant_session(request, response, str(new_id))
+    return response
 
 
 @router.get("/session/{session_id}", response_class=HTMLResponse)
@@ -94,27 +103,37 @@ async def live_session(request: Request, session_id: str):
 
 
 @router.get("/api/sessions/{session_id}/poll")
-async def poll_session(session_id: str):
+async def poll_session(request: Request, session_id: str):
+    allowed, data = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
-        data = await api_get(f"/api/v1/public/sessions/{session_id}")
+        if data is None:
+            data = await api_get(f"/api/v1/public/sessions/{session_id}")
         return JSONResponse(data)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return safe_error(e)
 
 
 @router.post("/api/sessions/{session_id}/stop")
-async def stop_session(session_id: str):
+async def stop_session(request: Request, session_id: str):
+    allowed, _ = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
         result = await api_post(f"/api/v1/public/sessions/{session_id}/stop", {})
         return JSONResponse(result)
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        return safe_error(e)
 
 
 @router.post("/api/sessions/{session_id}/cancel")
-async def cancel_session(session_id: str):
+async def cancel_session(request: Request, session_id: str):
+    allowed, _ = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
         result = await api_post(f"/api/v1/public/sessions/{session_id}/cancel", {})
         return JSONResponse(result)
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        return safe_error(e)

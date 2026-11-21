@@ -9,8 +9,12 @@ import config
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Headers to forward from driver's browser to Core API (cert identity + OS detection)
-_FORWARD_HEADERS = ("X-Client-Cert-Serial", "X-Client-Cert-DN", "X-Client-Cert-Verify", "User-Agent")
+# Headers to forward from driver's browser to Core API (cert identity + OS detection).
+# The X-Client-Cert-* headers are only meaningful when set by a TLS-terminating
+# proxy that verified a client certificate; any client can send them, so they are
+# forwarded ONLY when config.TRUST_CLIENT_CERT_HEADER is enabled.
+_CERT_HEADERS = ("X-Client-Cert-Serial", "X-Client-Cert-DN", "X-Client-Cert-Verify")
+_FORWARD_HEADERS = ("User-Agent",)
 
 # Content types that should be returned as binary (not parsed as JSON)
 _BINARY_TYPES = ("application/x-pkcs12", "application/x-pem-file", "application/x-x509-ca-cert")
@@ -73,7 +77,8 @@ async def proxy_cert_setup(request: Request, path: str):
     Forwards: query params, request body, relevant headers.
     """
     core_url = f"/api/v1/public/cert-setup/{path}"
-    fwd_headers = {h: request.headers[h] for h in _FORWARD_HEADERS if h in request.headers}
+    names = _FORWARD_HEADERS + (_CERT_HEADERS if config.TRUST_CLIENT_CERT_HEADER else ())
+    fwd_headers = {h: request.headers[h] for h in names if h in request.headers}
 
     async with httpx.AsyncClient(base_url=config.CORE_API, timeout=15) as client:
         if request.method == "POST":

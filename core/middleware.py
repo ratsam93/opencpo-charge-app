@@ -68,7 +68,12 @@ async def inject_context(request, call_next):
     request.state.auth_method = None
 
     # ── 1. Client certificate (strongest — Safari with mTLS) ────────────
-    cert_serial = (request.headers.get("X-Client-Cert-Serial") or "").strip()
+    # Only honoured when a trusted TLS-terminating proxy is configured (see
+    # config.TRUST_CLIENT_CERT_HEADER); otherwise any client could impersonate
+    # any certificate holder by sending this header.
+    cert_serial = ""
+    if config.TRUST_CLIENT_CERT_HEADER:
+        cert_serial = (request.headers.get("X-Client-Cert-Serial") or "").strip()
     request.state.account = None
     _set_device_cookie = False
 
@@ -123,14 +128,10 @@ async def inject_context(request, call_next):
     request.state.lang = lang
     request.state.t = _TRANSLATIONS.get(lang, _TRANSLATIONS.get(DEFAULT_LANG, {}))
 
-    # ── 5. Inject account into Jinja2 template context ──────────────────
-    # So base.html nav can always check `account` without each route passing it
-    templates = getattr(request.app.state, "templates", None)
-    if templates:
-        templates.env.globals["account"] = request.state.account
-        templates.env.globals["auth_method"] = request.state.auth_method
-        templates.env.globals["cert_renewal_needed"] = request.state.cert_renewal_needed
-        templates.env.globals["cert_days_left"] = request.state.cert_days_left
+    # Account info reaches templates through template_context() below (a Jinja2
+    # context processor). It used to be written to templates.env.globals, which
+    # is shared by ALL concurrent requests and could show one driver's account
+    # on another driver's page.
 
     response = await call_next(request)
 
@@ -148,7 +149,7 @@ async def inject_context(request, call_next):
         response.set_cookie(
             DEVICE_COOKIE, device_jwt,
             max_age=DEVICE_COOKIE_MAX_AGE,
-            httponly=True, secure=True, samesite="lax",
+            httponly=True, secure=config.COOKIE_SECURE, samesite="lax",
         )
 
     # Set lang cookie if query param was used (persist the choice)
@@ -157,3 +158,14 @@ async def inject_context(request, call_next):
         response.set_cookie("lang", query_lang, max_age=60 * 60 * 24 * 30, samesite="lax")
 
     return response
+
+
+def template_context(request) -> dict:
+    """Jinja2 context processor: per-request account state (never shared)."""
+    st = request.state
+    return {
+        "account": getattr(st, "account", None),
+        "auth_method": getattr(st, "auth_method", None),
+        "cert_renewal_needed": getattr(st, "cert_renewal_needed", False),
+        "cert_days_left": getattr(st, "cert_days_left", None),
+    }

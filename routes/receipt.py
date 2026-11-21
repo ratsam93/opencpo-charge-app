@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResp
 
 import config
 from core.api import api_get
+from core.security import authorize_session, forbidden, safe_error
 
 router = APIRouter()
 
@@ -22,17 +23,24 @@ async def receipt_screen(request: Request, session_id: str):
 
 
 @router.get("/api/sessions/{session_id}/receipt")
-async def get_receipt(session_id: str):
+async def get_receipt(request: Request, session_id: str):
+    allowed, data = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
-        data = await api_get(f"/api/v1/public/sessions/{session_id}")
+        if data is None:
+            data = await api_get(f"/api/v1/public/sessions/{session_id}")
         return JSONResponse(data)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return safe_error(e)
 
 
 @router.get("/api/sessions/{session_id}/pdf")
-async def download_pdf(session_id: str):
+async def download_pdf(request: Request, session_id: str):
     """Proxy PDF download from OCPP Core."""
+    allowed, _ = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     async with httpx.AsyncClient(base_url=config.CORE_API, timeout=30) as client:
         r = await client.get(f"/api/v1/public/sessions/{session_id}/pdf")
         if not r.is_success:

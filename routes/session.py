@@ -5,10 +5,16 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from core.api import api_get, api_post
+from core.security import authorize_session, forbidden, grant_session, safe_error, browser_owns
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _digits(value) -> str:
+    """Compare phone numbers by digits only (ignores +, spaces, dashes)."""
+    return "".join(ch for ch in str(value) if ch.isdigit())
 
 
 @router.post("/api/sessions/create")
@@ -30,10 +36,14 @@ async def create_session(request: Request):
                 f"/api/v1/public/sessions/pending?cp_id={cp_id}&driver_phone={driver_phone}"
             )
             # If a pending session exists for the SAME connector, reuse it
+            # Only reuse it when THIS browser created it: the phone number is
+            # unverified, so anyone could otherwise fetch someone else's session.
             if existing and isinstance(existing, dict):
                 ex_connector = existing.get("connector_id")
                 ex_status = existing.get("status", "")
-                if ex_connector == connector_id and ex_status in ("pending", "awaiting_payment"):
+                ex_id = existing.get("id") or existing.get("session_id")
+                if (ex_connector == connector_id and ex_status in ("pending", "awaiting_payment")
+                        and ex_id is not None and browser_owns(request, str(ex_id))):
                     return JSONResponse(existing)
         except Exception:
             # Endpoint may not exist or return 404 — not fatal, proceed to create
@@ -76,9 +86,26 @@ async def create_session(request: Request):
 
     try:
         result = await api_post("/api/v1/public/sessions", body)
-        return JSONResponse(result)
     except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+        return safe_error(e)
+    new_id = (result.get("id") or result.get("session_id")) if isinstance(result, dict) else None
+    # Core's duplicate guard keys on charger + connector only, so within its window
+    # it answers a create from a DIFFERENT driver with the existing session
+    # ({"session_id", "status": "waiting", "message": ...}, no created_at). Never hand
+    # that out or grant ownership of it, unless this very browser already owns it
+    # (a legitimate retry after a redirect).
+    fresh = isinstance(result, dict) and ("created_at" in result or "payment_status" in result)
+    foreign_phone = (isinstance(result, dict) and driver_phone and result.get("driver_phone")
+                     and _digits(result["driver_phone"]) != _digits(driver_phone))
+    if new_id is not None and (foreign_phone or (not fresh and not browser_owns(request, str(new_id)))):
+        logger.warning("create_session: core returned an existing session on %s/%s that this browser does not own",
+                       cp_id, connector_id)
+        return JSONResponse(
+            {"error": "Connector busy — this connector is already in use."}, status_code=409)
+    response = JSONResponse(result)
+    if new_id is not None:
+        grant_session(request, response, str(new_id))
+    return response
 
 
 @router.get("/session/{session_id}", response_class=HTMLResponse)
@@ -94,27 +121,37 @@ async def live_session(request: Request, session_id: str):
 
 
 @router.get("/api/sessions/{session_id}/poll")
-async def poll_session(session_id: str):
+async def poll_session(request: Request, session_id: str):
+    allowed, data = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
-        data = await api_get(f"/api/v1/public/sessions/{session_id}")
+        if data is None:
+            data = await api_get(f"/api/v1/public/sessions/{session_id}")
         return JSONResponse(data)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return safe_error(e)
 
 
 @router.post("/api/sessions/{session_id}/stop")
-async def stop_session(session_id: str):
+async def stop_session(request: Request, session_id: str):
+    allowed, _ = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
         result = await api_post(f"/api/v1/public/sessions/{session_id}/stop", {})
         return JSONResponse(result)
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        return safe_error(e)
 
 
 @router.post("/api/sessions/{session_id}/cancel")
-async def cancel_session(session_id: str):
+async def cancel_session(request: Request, session_id: str):
+    allowed, _ = await authorize_session(request, session_id)
+    if not allowed:
+        return forbidden()
     try:
         result = await api_post(f"/api/v1/public/sessions/{session_id}/cancel", {})
         return JSONResponse(result)
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        return safe_error(e)

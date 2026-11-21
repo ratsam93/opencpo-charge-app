@@ -225,3 +225,10 @@ Apache 2.0 — see [LICENSE](LICENSE).
 pip install -r requirements-dev.txt
 pytest
 ```
+
+## Known limits (need changes in Core)
+
+Found by running this app against a real Core:
+- Core's duplicate-session guard keys on charger + connector only and answers a create from a *different* driver with the existing session. This app refuses to hand that out (HTTP 409) and never grants ownership of it. Core should key the guard on the driver, or return 409 itself.
+- Core's public session JSON has no owner field (`account_id`/`driver_id`/`driver_account_id`), so a logged-in driver cannot prove ownership from a fresh browser; sessions are owned by the browser cookie that created them. Core should return `driver_account_id`.
+- Core links sessions to an account by an unverified phone number at registration, and serves `GET /api/v1/public/sessions/{id}` and `POST .../stop` without credentials (including driver phone and email). Keep Core's ports private.

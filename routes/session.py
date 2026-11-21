@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _digits(value) -> str:
+    """Compare phone numbers by digits only (ignores +, spaces, dashes)."""
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
+
 @router.post("/api/sessions/create")
 async def create_session(request: Request):
     body = await request.json()
@@ -83,8 +88,21 @@ async def create_session(request: Request):
         result = await api_post("/api/v1/public/sessions", body)
     except HTTPException as e:
         return safe_error(e)
+    new_id = (result.get("id") or result.get("session_id")) if isinstance(result, dict) else None
+    # Core's duplicate guard keys on charger + connector only, so within its window
+    # it answers a create from a DIFFERENT driver with the existing session
+    # ({"session_id", "status": "waiting", "message": ...}, no created_at). Never hand
+    # that out or grant ownership of it, unless this very browser already owns it
+    # (a legitimate retry after a redirect).
+    fresh = isinstance(result, dict) and ("created_at" in result or "payment_status" in result)
+    foreign_phone = (isinstance(result, dict) and driver_phone and result.get("driver_phone")
+                     and _digits(result["driver_phone"]) != _digits(driver_phone))
+    if new_id is not None and (foreign_phone or (not fresh and not browser_owns(request, str(new_id)))):
+        logger.warning("create_session: core returned an existing session on %s/%s that this browser does not own",
+                       cp_id, connector_id)
+        return JSONResponse(
+            {"error": "Connector busy — this connector is already in use."}, status_code=409)
     response = JSONResponse(result)
-    new_id = result.get("id") or result.get("session_id") if isinstance(result, dict) else None
     if new_id is not None:
         grant_session(request, response, str(new_id))
     return response

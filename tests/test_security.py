@@ -148,3 +148,35 @@ def test_unknown_skin_falls_back_to_default():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert out.stdout.strip().splitlines()[-1] == "200", out.stderr[-500:]
+
+
+# ── found by live testing against real core ──────────────────────────────
+
+def test_foreign_duplicate_session_is_not_handed_out(make_client, state):
+    state["duplicate_of_other"] = "S-OTHER"
+    r = make_client().post("/api/sessions/create", json=CREATE)
+    assert r.status_code == 409
+    assert "S-OTHER" not in r.text
+    assert "session_access" not in r.headers.get("set-cookie", "")
+
+
+def test_owner_can_retry_into_own_duplicate_session(make_client, state):
+    """A redirect-loop retry by the browser that created the session still works."""
+    c = make_client()
+    assert c.post("/api/sessions/create", json=CREATE).status_code == 200   # creates S-1
+    state["duplicate_of_other"] = "S-1"
+    r = c.post("/api/sessions/create", json=CREATE)
+    assert r.status_code == 200 and r.json()["session_id"] == "S-1"
+
+
+def test_cert_setup_does_not_forward_cert_headers_by_default(make_client, calls):
+    make_client().get("/api/cert-setup/verify", headers={"X-Client-Cert-Serial": "ABC123"})
+    seen = [x for x in calls if "cert-setup" in x["path"]]
+    assert seen and all(x["x_client_cert_serial"] is None for x in seen)
+
+
+def test_cert_setup_forwards_cert_headers_when_trusted_proxy(make_client, calls, monkeypatch):
+    monkeypatch.setattr(config, "TRUST_CLIENT_CERT_HEADER", True)
+    make_client().get("/api/cert-setup/verify", headers={"X-Client-Cert-Serial": "ABC123"})
+    seen = [x for x in calls if "cert-setup" in x["path"]]
+    assert seen and seen[0]["x_client_cert_serial"] == "ABC123"

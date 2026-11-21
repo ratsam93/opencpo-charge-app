@@ -18,18 +18,33 @@ import config  # noqa: E402
 
 mock_core = FastAPI()
 CALLS: list[dict] = []
-STATE = {"fail": False}
+STATE = {"fail": False, "duplicate_of_other": None}
 
 
 def _log(request: Request):
     CALLS.append({"method": request.method, "path": request.url.path,
-                  "x_api_key": request.headers.get("x-api-key")})
+                  "x_api_key": request.headers.get("x-api-key"),
+                  "x_client_cert_serial": request.headers.get("x-client-cert-serial")})
 
 
 @mock_core.post("/api/v1/public/sessions")
 async def create(request: Request):
     _log(request)
-    return {"id": "S-1", "status": "pending", "connector_id": 1}
+    body = await request.json()
+    if STATE["duplicate_of_other"]:
+        # Real core's duplicate guard answers with the EXISTING session in this shape
+        # (observed live): no created_at, no phone/email.
+        return {"session_id": STATE["duplicate_of_other"], "status": "waiting",
+                "message": "Charger is starting, please try again in 10 seconds."}
+    return {"session_id": "S-1", "cp_id": body.get("cp_id"), "connector_id": 1,
+            "payment_status": "pending", "rate_kwh": 0.35, "pricing_tier": "public",
+            "created_at": "2026-11-21T12:00:00+00:00"}
+
+
+@mock_core.api_route("/api/v1/public/cert-setup/{path:path}", methods=["GET", "POST"])
+async def cert_setup(path: str, request: Request):
+    _log(request)
+    return {"status": "ok"}
 
 
 @mock_core.get("/api/v1/public/sessions/pending")
@@ -91,6 +106,7 @@ class _MockClient(_RealClient):
 def _reset(monkeypatch):
     CALLS.clear()
     STATE["fail"] = False
+    STATE["duplicate_of_other"] = None
     monkeypatch.setattr(httpx, "AsyncClient", _MockClient)
     import core.api
     monkeypatch.setattr(core.api, "CORE_API_KEY", "mgmt-test-key")
